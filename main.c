@@ -46,64 +46,25 @@
 #include "cybsp.h"
 
 /*******************************************************************************
- * Macros
- ********************************************************************************/
-#define LED_OFF                     (1u)
-#define LED_ON                      (0u)
-
-#define LPCOMP_OUTPUT_LOW        (0u)
-#define LPCOMP_OUTPUT_HIGH       (1u)
-
-/* Delays */
-#define LPCOMP_LP_START_UP_DELAY_US  (10u)
-#define TOGGLE_LED_PERIOD            (500u)
-#define LED_ON_2S_BEFORE_SLEEP       (2000u)
-
-/* Glitch delays */
-#define LONG_GLITCH_DELAY_MS    (250U)   /* in ms */
-
-/* To demonstrate how PDL drivers are used to manually configure the peripherals,
- * set the PDL_CONFIGURATION #define to 1, otherwise set to 0.
- */
-#define PDL_CONFIGURATION   (0u)
-
-/*******************************************************************************
- * Function Prototypes
- ********************************************************************************/
-void lpcomp_isr();
-
-/*******************************************************************************
  * Global Variables
  ********************************************************************************/
 /* LPComp context structure */
 cy_stc_lpcomp_context_t lpcomp_context;
 
+/*******************************************************************************
+ * Function Prototypes
+ ********************************************************************************/
+/* LPComp interrupt service routine */
+void lpcomp_isr_callback();
+
 /******************************************************************************
  * Interrupt configuration structure
  *******************************************************************************/
+ /* LPComp interrupt service routine configuration */
 const cy_stc_sysint_t lpcomp_intr_config = {
-        .intrSrc = lpcomp_interrupt_IRQn,  /* Source of interrupt signal */
-        .intrPriority = 3                  /* Interrupt priority */
+    .intrSrc = lpcomp_interrupt_IRQn,  /* Source of interrupt signal */
+    .intrPriority = 3                  /* Interrupt priority */
 };
-
-#if PDL_CONFIGURATION
-const cy_stc_lpcomp_config_t lpcomp_config =
-{
-        .outputMode = CY_LPCOMP_OUT_DIRECT,
-        .hysteresis = CY_LPCOMP_HYST_DISABLE,
-        .power = CY_LPCOMP_MODE_ULP,
-        .intType = CY_LPCOMP_INTR_FALLING,
-};
-
-cy_stc_gpio_pin_config_t pin_config = {
-        /*.outVal     */ 1UL,                       /* Output = High */
-        /*.driveMode  */ CY_GPIO_DM_STRONG_IN_OFF,  /* Resistive pull-up, input buffer on */
-        /*.hsiom      */ P2_0_GPIO,                 /* Software controlled pin */
-        /*.intEdge    */ CY_GPIO_INTR_DISABLE,      /* Rising edge interrupt */
-        /*.vtrip      */ CY_GPIO_VTRIP_CMOS,        /* CMOS voltage trip */
-        /*.slewRate   */ CY_GPIO_SLEW_FAST,         /* Fast slew rate */
-};
-#endif
 
 /*******************************************************************************
  * Function Name: main
@@ -111,9 +72,9 @@ cy_stc_gpio_pin_config_t pin_config = {
  * Summary:
  * System entrance point. This function performs
  *    1. Initializes the BSP.
- *    2. Initialize and enable GPIO interrupt.
+ *    2. Initialize and enable LPComp interrupt.
  *    3. Initialize and enable the LPComp peripheral.
- *    4. Compares the GPIO input voltages.
+ *    4. Compares the LPComp input voltages.
  *    5. Operates the CPU in Deep Sleep and wakeup mode.
  *
  * Parameters:
@@ -127,112 +88,97 @@ int main(void)
 {
     cy_rslt_t result;
 
-    /* Initialize the device and board peripherals */
-    result = cybsp_init();
+    /* Variable to store the calibration value */
+    uint32_t trim_val;
 
-    /* Board init failed. Stop program execution. */
+    /* Initialize the device and board peripherals */
+    result = cybsp_init() ;
     if (result != CY_RSLT_SUCCESS)
     {
+        /* Insert the error handling here */
         CY_ASSERT(0);
     }
 
     /* Enable global interrupts */
     __enable_irq();
 
-    /* Initialize and enable GPIO interrupt */
-    result = Cy_SysInt_Init(&lpcomp_intr_config, lpcomp_isr);
+    /* Initializes LPComp interrupt */
+    result = Cy_SysInt_Init(&lpcomp_intr_config, lpcomp_isr_callback);
     if(result != CY_SYSINT_SUCCESS)
     {
+        /* Insert the error handling here */
         CY_ASSERT(0);
     }
 
-    /* Clearing and enabling the GPIO interrupt in NVIC */
+    /* Clearing and enabling the LPComp interrupt in NVIC */
     NVIC_ClearPendingIRQ(lpcomp_intr_config.intrSrc);
 
+    /* Enables LPComp interrupt */
     NVIC_EnableIRQ(lpcomp_intr_config.intrSrc);
 
-#if PDL_CONFIGURATION
-
-    /* Initialize GPIO pin P2.0 */
-    Cy_GPIO_Pin_Init(P2_0_PORT, P2_0_NUM, &pin_config);
-
-    /* Positive input (inp) to the P0[0] */
-    Cy_GPIO_Pin_FastInit(GPIO_PRT0, 0, CY_GPIO_DM_ANALOG, 1, HSIOM_SEL_GPIO);
-
-    /* Negative input (inn) to the P0[1] */
-    Cy_GPIO_Pin_FastInit(GPIO_PRT0, 1, CY_GPIO_DM_ANALOG, 1, HSIOM_SEL_GPIO);
-
-    /* Initialize the LPComp peripheral */
+    /* Initializes the LPComp peripheral */
     if(CY_LPCOMP_SUCCESS != Cy_LPComp_Init(LPCOMP, CY_LPCOMP_CHANNEL_0, &lpcomp_config, &lpcomp_context))
     {
+        /* Insert the error handling here */
         CY_ASSERT(0);
     }
 
     /* Configure LPComp interrupt */
     Cy_LPComp_SetInterruptMask(LPCOMP, CY_LPCOMP_CHANNEL0_INTR);
 
-    /* Enable the LPComp channel 0 */
+    /* Enables the LPComp peripheral */
     Cy_LPComp_Enable(LPCOMP, CY_LPCOMP_CHANNEL_0, &lpcomp_context);
 
-    /* It needs 10us start-up time to settle LPComp channel in LP mode after power up */
-    Cy_SysLib_DelayUs(LPCOMP_LP_START_UP_DELAY_US);
-#else
-    /* Initialize and enable the LPComp peripheral */
-    if(CY_LPCOMP_SUCCESS != Cy_LPComp_Init(LPCOMP, CY_LPCOMP_CHANNEL_0, &LPComp_1_config, &lpcomp_context))
-    {
-        CY_ASSERT(0);
-    }
+    /* Performs custom calibration of the input offset to minimize the error for a
+    * specific set of conditions: the comparator reference voltage, supply voltage,
+    * and operating temperature. A reference voltage in the range at which the
+    * comparator will be used must be applied to the Vminus input of the
+    * comparator. This can be done using an external resistive divider for example.
+    */
+    trim_val = Cy_LPComp_ZeroCal(LPCOMP, CY_LPCOMP_CHANNEL_0);
 
-    /* Configure LPComp interrupt */
-    Cy_LPComp_SetInterruptMask(LPCOMP, CY_LPCOMP_CHANNEL0_INTR);
+    /* Sets the Comparator trim value. Actually it is already done as a part of
+    * ZeroCal() function. This demonstrates method to set trim register with specific
+    * value.
+    */
+    Cy_LPComp_LoadTrim(LPCOMP, CY_LPCOMP_CHANNEL_0, trim_val);
 
-    Cy_LPComp_Enable(LPCOMP, CY_LPCOMP_CHANNEL_0, &lpcomp_context);
-#endif
+    /* Sets Drive power mode and speed configuration. */
+    Cy_LPComp_SetPower(LPCOMP, CY_LPCOMP_CHANNEL_0, CY_LPCOMP_MODE_ULP);
 
     /* SysPm callback params */
     cy_stc_syspm_callback_params_t callbackParams = {
-            /*.base       =*/ LPCOMP,
-            /*.context    =*/ NULL
+        /*.base       =*/ LPCOMP,
+        /*.context    =*/ NULL
     };
 
     /* Callback declaration for Deep Sleep mode */
     cy_stc_syspm_callback_t deep_sleep_cb = {Cy_LPComp_DeepSleepCallback,  /* Callback function */
-            CY_SYSPM_DEEPSLEEP,           /* Callback type */
-            0,                            /* Skip mode */
-            &callbackParams,              /* Callback params */
-            NULL, NULL};                  /* For internal usage */
+        CY_SYSPM_DEEPSLEEP,           /* Callback type */
+        0,                            /* Skip mode */
+        &callbackParams,              /* Callback params */
+        NULL, NULL};                  /* For internal usage */
 
     /* Register Deep Sleep callback */
     if (true != Cy_SysPm_RegisterCallback(&deep_sleep_cb))
     {
+        /* Insert the error handling here */
         CY_ASSERT(0);
     }
 
     for (;;)
     {
-        if (Cy_LPComp_GetCompare(LPCOMP, CY_LPCOMP_CHANNEL_0) == LPCOMP_OUTPUT_HIGH)
-        {
-            Cy_GPIO_Inv(P2_0_PORT, P2_0_NUM);
-            Cy_SysLib_Delay(TOGGLE_LED_PERIOD);
-        }
-        else
-        {
-            Cy_GPIO_Write(P2_0_PORT, P2_0_NUM, LED_ON);
-            Cy_SysLib_Delay(LED_ON_2S_BEFORE_SLEEP);
-            Cy_GPIO_Write(P2_0_PORT, P2_0_NUM, LED_OFF);
-
-            Cy_SysPm_CpuEnterDeepSleep();
-            Cy_SysLib_Delay(LONG_GLITCH_DELAY_MS);
-        }
+        /* Sets the system into deep sleep power mode */
+        Cy_SysPm_CpuEnterDeepSleep();
     }
 }
 
 /*******************************************************************************
- * Function Name: lpcomp_isr
+ * Function Name: lpcomp_isr_callback
  ********************************************************************************
  * Summary:
- *  Interrupt service routine for the GPIO interrupt triggered from LPComp.
- *  This function clears the triggered GPIO pin interrupt. 
+ *  Interrupt service routine for LPComp.
+ *  This function clears the triggered LPComp interrupt.
  *
  * Parameters:
  *  None
@@ -241,9 +187,12 @@ int main(void)
  *  void
  *
  *******************************************************************************/
-void lpcomp_isr()
+void lpcomp_isr_callback(void)
 {
-    /* Clear the triggered pin interrupt */
+    /* Set the LED value accordingly to the PLComp output */
+    Cy_GPIO_Write(USER_LED_PORT, USER_LED_NUM, Cy_LPComp_GetCompare(LPCOMP, CY_LPCOMP_CHANNEL_0));
+
+    /* Clear pending interrupts */
     Cy_LPComp_ClearInterrupt(LPCOMP, CY_LPCOMP_CHANNEL0_INTR);
 }
 
